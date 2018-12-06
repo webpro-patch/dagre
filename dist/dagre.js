@@ -467,6 +467,127 @@ var _ = require("./lodash"),
 
 module.exports = layout;
 
+function hasMultiplePorts(g, node) {
+  var inPorts = {};
+  var outPorts = {};
+
+  _.forEach(g.nodeEdges(node), function (edge) {
+    if (edge.v === node && edge.vport) {
+      inPorts[edge.vport] = {};
+    } else if (edge.w === node && edge.wport) {
+      outPorts[edge.wport] = {};
+    }
+  });
+
+  return  _.size(inPorts) > 1 || _.size(outPorts) > 1;
+}
+
+function addDummyPortNode(g, parent, port, order) {
+  var dummyNode = util.addDummyNode(g, "port", {}, "port");
+  var node = g.node(dummyNode);
+  node.port = port;
+  node.rank = g.node(parent).rank;
+  g.setParent(dummyNode, parent);
+  return dummyNode;
+}
+
+function addPortNodes(g, node) {
+  // Create the port nodes
+  var portNodes = {};
+  _.forEach(g.node(node).ports, function (port) {
+    portNodes[port] = addDummyPortNode(g, node, port);
+  });
+  // Set the order of children to be fixed
+  g.node(node).fixedOrder = true;
+
+  // Hook up the edges to the port nodes
+  _.forEach(g.nodeEdges(node), function (edge) {
+    var port;
+    if (edge.v === node && edge.vport) {
+      var dummyNode = portNodes[edge.vport];
+      g.setEdge(dummyNode, edge.w, {
+        weight: 1,
+        dummy: "port",
+        edge: edge,
+        edgeValue: g.edge(edge)
+      });
+      g.removeEdge(edge);
+      // TODO: Handle children.
+      // if (!children.length) {
+      //   g.setEdge(edge.v, dummyNode);
+      // }
+    } else if (edge.w === node && edge.wport) {
+      var dummyNode = portNodes[edge.wport];
+      g.setEdge(edge.v, dummyNode, {
+        weight: 1,
+        dummy: "port",
+        edge: edge,
+        edgeValue: g.edge(edge)
+      });
+      g.removeEdge(edge);
+      // TODO: Handle children.
+      // if (!children.length) {
+      //   g.setEdge(dummyNode, edge.w);
+      // }
+    }
+  });
+
+  // Remove unused port nodes
+  _.forEach(portNodes, function (node) {
+    if (!g.nodeEdges(node).length) {
+      g.removeNode(node);
+    }
+  });
+}
+
+function insertPortNodes(g) {
+  function dfs(node) {
+    var children = g.children(node);
+    _.forEach(children, dfs);
+
+    if (hasMultiplePorts(g, node)) {
+      addPortNodes(g, node);
+    }
+  }
+
+  _.forEach(g.children(), dfs);
+}
+
+function fixOrdering(g, layering) {
+  _.each(layering, function(layer) {
+    var order = 0;
+    _.each(layer, function(node) {
+      if (node) {
+        g.node(node).order = order++;
+      }
+    });
+  });
+}
+
+function removePortNodes(g) {
+  // Remove the dummy port edges added earlier
+  _.forEach(g.edges(), function (edge) {
+    var value = g.edge(edge);
+    if (value.dummy === "port") {
+      g.setEdge(value.edge, value.edgeValue);
+      g.removeEdge(edge);
+    }
+  });
+
+  // Remove the dummy port nodes added earlier
+  _.forEach(g.nodes(), function (node) {
+    var value = g.node(node);
+    if (value.dummy === "port") {
+      g.node(g.parent(node)).order = value.order;
+      g.removeNode(node);
+    }
+  });
+
+  // Fix node ordering since there are gaps from removing dummy nodes
+  var layering = util.buildLayerMatrix(g);
+  fixOrdering(g, layering);
+}
+
 function layout(g, opts) {
   var time = opts && opts.debugTiming ? util.time : util.notime;
   time("layout", function() {
@@ -492,7 +613,9 @@ function runLayout(g, time) {
   time("    normalize.run",          function() { normalize.run(g); });
   time("    parentDummyChains",      function() { parentDummyChains(g); });
   time("    addBorderSegments",      function() { addBorderSegments(g); });
+  time("    insertPortNodes",        function() { insertPortNodes(g); });
   time("    order",                  function() { order(g); });
+  time("    removePortNodes",        function() { removePortNodes(g); });
   time("    insertSelfEdges",        function() { insertSelfEdges(g); });
   time("    adjustCoordinateSystem", function() { coordinateSystem.adjust(g); });
   time("    position",               function() { position(g); });
@@ -549,12 +672,13 @@ var graphNumAttrs = ["nodesep", "edgesep", "ranksep", "marginx", "marginy"],
     graphAttrs = ["acyclicer", "ranker", "rankdir", "align"],
     nodeNumAttrs = ["width", "height"],
     nodeDefaults = { width: 0, height: 0 },
+    nodeAttrs = ["ports"],
     edgeNumAttrs = ["minlen", "weight", "width", "height", "labeloffset"],
     edgeDefaults = {
       minlen: 1, weight: 1, width: 0, height: 0,
       labeloffset: 10, labelpos: "r"
     },
-    edgeAttrs = ["labelpos"];
+    edgeAttrs = ["labelpos", "vport", "wport"];
 
 /*
  * Constructs a new graph from the input graph, which can be used for layout.
@@ -573,7 +697,10 @@ function buildLayoutGraph(inputGraph) {
 
   _.forEach(inputGraph.nodes(), function(v) {
     var node = canonicalize(inputGraph.node(v));
-    g.setNode(v, _.defaults(selectNumberAttrs(node, nodeNumAttrs), nodeDefaults));
+    g.setNode(v, _.merge({},
+      nodeDefaults,
+      selectNumberAttrs(node, nodeNumAttrs),
+      _.pick(node, nodeAttrs)));
     g.setParent(v, inputGraph.parent(v));
   });
 
@@ -1031,6 +1158,8 @@ function normalizeEdge(g, e) {
       wRank = g.node(w).rank,
       name = e.name,
       edgeLabel = g.edge(e),
+      vport = edgeLabel.vport,
+      wport = edgeLabel.wport,
       labelRank = edgeLabel.labelRank;
 
   if (wRank === vRank + 1) return;
@@ -1043,7 +1172,8 @@ function normalizeEdge(g, e) {
     attrs = {
       width: 0, height: 0,
       edgeLabel: edgeLabel, edgeObj: e,
-      rank: vRank
+      rank: vRank,
+      vport: vport, wport: wport
     };
     dummy = util.addDummyNode(g, "edge", attrs, "_d");
     if (vRank === labelRank) {
@@ -1052,14 +1182,14 @@ function normalizeEdge(g, e) {
       attrs.dummy = "edge-label";
       attrs.labelpos = edgeLabel.labelpos;
     }
-    g.setEdge(v, dummy, { weight: edgeLabel.weight }, name);
+    g.setEdge(v, dummy, { weight: edgeLabel.weight, vport: vport, wport: wport }, name);
     if (i === 0) {
       g.graph().dummyChains.push(dummy);
     }
     v = dummy;
   }
 
-  g.setEdge(v, w, { weight: edgeLabel.weight }, name);
+  g.setEdge(v, w, { weight: edgeLabel.weight, vport: vport, wport: wport }, name);
 }
 
 function undo(g) {
@@ -1423,12 +1553,21 @@ function initOrder(g) {
       maxRank = _.max(_.map(simpleNodes, function(v) { return g.node(v).rank; })),
       layers = _.map(_.range(maxRank + 1), function() { return []; });
 
-  function dfs(v) {
-    if (_.has(visited, v)) return;
+  function visitNode(v) {
     visited[v] = true;
     var node = g.node(v);
     layers[node.rank].push(v);
     _.forEach(g.successors(v), dfs);
+  }
+
+  function dfs(v) {
+    if (_.has(visited, v)) return;
+    var parent = g.parent(v);
+    if (parent && g.node(parent).fixedOrder) {
+      _.forEach(g.children(parent), visitNode);
+    } else {
+      visitNode(v);
+    }
   }
 
   var orderedVs = _.sortBy(simpleNodes, function(v) { return g.node(v).rank; });
@@ -1575,6 +1714,7 @@ function sortSubgraph(g, v, cg, biasRight) {
       node = g.node(v),
       bl = node ? node.borderLeft : undefined,
       br = node ? node.borderRight: undefined,
+      fixedOrder = node ? node.fixedOrder : false,
       subgraphs = {};
 
   if (bl) {
@@ -1597,7 +1737,7 @@ function sortSubgraph(g, v, cg, biasRight) {
   var entries = resolveConflicts(barycenters, cg);
   expandSubgraphs(entries, subgraphs);
 
-  var result = sort(entries, biasRight);
+  var result = sort(entries, biasRight, fixedOrder);
 
   if (bl) {
     result.vs = _.flatten([bl, result.vs, br], true);
@@ -1646,7 +1786,7 @@ var _ = require("../lodash"),
 
 module.exports = sort;
 
-function sort(entries, biasRight) {
+function sort(entries, biasRight, fixedOrder) {
   var parts = util.partition(entries, function(entry) {
     return _.has(entry, "barycenter");
   });
@@ -1657,7 +1797,7 @@ function sort(entries, biasRight) {
       weight = 0,
       vsIndex = 0;
 
-  sortable.sort(compareWithBias(!!biasRight));
+  sortable.sort(compareWithBias(!!biasRight, fixedOrder));
 
   vsIndex = consumeUnsortable(vs, unsortable, vsIndex);
 
@@ -1687,9 +1827,11 @@ function consumeUnsortable(vs, unsortable, index) {
   return index;
 }
 
-function compareWithBias(bias) {
+function compareWithBias(bias, fixedOrder) {
   return function(entryV, entryW) {
-    if (entryV.barycenter < entryW.barycenter) {
+    if (fixedOrder) {
+      return entryV.i - entryW.i;
+    } else if (entryV.barycenter < entryW.barycenter) {
       return -1;
     } else if (entryV.barycenter > entryW.barycenter) {
       return 1;
@@ -2819,9 +2961,10 @@ function buildLayerMatrix(g) {
   var layering = _.map(_.range(maxRank(g) + 1), function() { return []; });
   _.forEach(g.nodes(), function(v) {
     var node = g.node(v),
+        order = node.order,
         rank = node.rank;
-    if (!_.isUndefined(rank)) {
-      layering[rank][node.order] = v;
+    if (!_.isUndefined(rank) && !_.isUndefined(order)) {
+      layering[rank][order] = v;
     }
   });
   return layering;
