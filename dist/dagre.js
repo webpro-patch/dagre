@@ -512,10 +512,6 @@ function addPortNodes(g, node) {
         edgeValue: g.edge(edge)
       });
       g.removeEdge(edge);
-      // TODO: Handle children.
-      // if (!children.length) {
-      //   g.setEdge(edge.v, dummyNode);
-      // }
     } else if (edge.w === node && edge.wport) {
       var dummyNode = portNodes[edge.wport];
       g.setEdge(edge.v, dummyNode, {
@@ -525,10 +521,6 @@ function addPortNodes(g, node) {
         edgeValue: g.edge(edge)
       });
       g.removeEdge(edge);
-      // TODO: Handle children.
-      // if (!children.length) {
-      //   g.setEdge(dummyNode, edge.w);
-      // }
     }
   });
 
